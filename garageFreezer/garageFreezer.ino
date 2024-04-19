@@ -58,6 +58,17 @@ static unsigned long displayTimeout                   = timerNow;   // delay for
 static const unsigned long SAMPLE_INTERVAL_MS         = 1000;       // 1 second read temp sensor interval
 unsigned long tempReadTimeout                         = timerNow;   // delay for reading temperature sensor 
 
+
+unsigned short alarmTime_ON                           = 500;        // alarm ON for 0.5 second
+unsigned short alarmTime_OFF                          = 1000;       // alarm OFF for 1 second
+unsigned long alarmTimer                              = timerNow;   // alarm buzzer ON / OFF timer
+
+unsigned short alarmTime_DELAY_ON                     = 10000;      // delay time for temp above alarm before sounding alarm
+unsigned long alarmTimer_DELAY                        = timerNow;   // 
+
+float alarmTemperature                                = 5.0;        // 5 degrees F (32-5 or 27 degrees below freezing)
+float alarmTemperatureError                           = -20.0;      // if freezer sensor ever reads below -20 then there is an error in the reading
+
 // ======= capture multiple sensor readings and average to avoid random spikes in reading
 const uint8_t tempAverageSize           = 10;
 float tempAverageArray[tempAverageSize] = {0};
@@ -82,8 +93,6 @@ unsigned long lastDebounceTimeButtonOne             = 0;    // the last time the
 unsigned long lastDebounceTimeButtonTwo             = 0;    // the last time the output pin was toggled
 unsigned long debounceDelay                         = 50;   // the debounce time; increase if the output flickers
 
-
-
 // =============== local functions ============================================
 void pre(void)
 {
@@ -107,8 +116,104 @@ void pre(void)
   u8x8.drawString(0, 1, "Freezer ESP-LINK");
 }
 
+//----- LED and BUZZER management functions
+#define LED_RED_PIN (9)
+#define LED_GRN_PIN (10)
+#define BZR_PIN (2)
+
+// ALARM STATES
+// 0 - ALARM OFF
+// 1 - ALARM TOGGLE ON
+// 2 - ALARM TOGGLE OFF
+// 3 - ALARM DELAY
+typedef enum ALARM_STATES
+{
+    ALARM_IDLE,
+    ALARM_ON,
+    ALARM_OFF,
+    ALARM_DELAY
+} alarm_states_t;
+
+void checkSetAlarm(float temperature)
+{
+  static alarm_states_t alarmSTATE = ALARM_IDLE;
+
+  // if temperature is COLD / GOOD then turn GRN LED ON and RED LED and BUZZER OFF
+  if((temperature < alarmTemperature) && (temperature > alarmTemperatureError))
+  {
+    alarmSTATE = ALARM_IDLE;          // ALARM IDLE state
+    digitalWrite(LED_GRN_PIN, LOW);   // turn the GRN LED ON. LED active LOW
+    digitalWrite(LED_RED_PIN, HIGH);  // turn the RED LED OFF.  LED active LOW
+    digitalWrite(BZR_PIN, HIGH);      // turn the BUZZER OFF.  BUZZER active LOW
+  }
+  else
+  {
+    timerNow = millis(); // Capture time now
+    // Else Temperature is above alarm temperature so take action
+    switch( alarmSTATE )
+    {
+      case ALARM_IDLE: // ALARM IDLE
+      // if previously in temperature OK/IDLE state, alarmSTATE IDLE, then
+      // check for temperature is HOT or ERROR reading then transition to delay state 
+      if((temperature > alarmTemperature) || (temperature < alarmTemperatureError)) // if temperature is above alarm temperature or below error temperature then transition to alarm state
+      {
+        alarmTimer_DELAY = timerNow + alarmTime_DELAY_ON; // set delay time to now plus delay wait time
+        alarmSTATE = ALARM_DELAY; // ALARM DELAY, we were in alarm IDLE state but transitioning to OVER TEMP STATE, so DELAY first
+      }
+      break;
+
+      case ALARM_ON: // ALARM TOGGLE ON
+      digitalWrite(LED_GRN_PIN, HIGH);  // turn the GRN LED OFF. LED active LOW
+      digitalWrite(LED_RED_PIN, LOW);   // turn the RED LED ON.  LED active LOW
+      digitalWrite(BZR_PIN, LOW);       // turn the BUZZER ON.  BUZZER active LOW
+      if( timerNow > alarmTimer )
+      {
+        // if we have stayed in ALARM ON state for longer than timeout then transition to alarm OFF
+        alarmTimer = timerNow + alarmTime_OFF;
+        alarmSTATE = ALARM_OFF;
+      }
+      break;
+
+      case ALARM_OFF: // ALARM TOGGLE OFF
+      digitalWrite(LED_GRN_PIN, HIGH);  // turn the GRN LED OFF. LED active LOW
+      digitalWrite(LED_RED_PIN, HIGH);  // turn the RED LED OFF.  LED active LOW
+      digitalWrite(BZR_PIN, HIGH);      // turn the BUZZER OFF.  BUZZER active LOW
+      if( timerNow > alarmTimer )
+      {
+        // if we have stayed in ALARM OFF state for longer than timeout then transition to alarm ON
+        alarmTimer = timerNow + alarmTime_ON;
+        alarmSTATE = ALARM_ON;
+      }
+      break;
+
+      case ALARM_DELAY: // ALARM DELAY
+      if( timerNow > alarmTimer_DELAY )
+      {
+        // if we have stayed in delay state for longer than delay timeout then transition to alarm ON
+        alarmTimer = timerNow + alarmTime_ON;
+        alarmSTATE = ALARM_ON;
+      }
+      break;
+
+      // Unknown state so transition to alarmSTATE Toggle ON to indicate an error
+      default:
+      alarmSTATE = ALARM_ON;
+      break;
+    }
+  }
+}
+
 void setup(void) 
 {
+  // RED / GRN LEDs and Buzzer are Active LOW.  Setting output low with enable LED / Buzzer
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GRN_PIN, OUTPUT);
+  pinMode(BZR_PIN, OUTPUT);
+
+  digitalWrite(LED_RED_PIN, HIGH);  // turn the LED OFF.  LED active LOW
+  digitalWrite(LED_GRN_PIN, HIGH);  // turn the LED OFF.  LED active LOW
+  digitalWrite(BZR_PIN, HIGH);      // turn the BZR OFF.  BZR active LOW
+
   Serial.begin(19200); // required for esp-link comms
   pinMode(buttonOnePin, INPUT_PULLUP);
   pinMode(buttonTwoPin, INPUT_PULLUP);
@@ -151,14 +256,15 @@ void setup(void)
 void loop(void) 
 {
   timerNow = millis(); // capture timer at this loop
+  float tempF = sensors.getTempFByIndex(0); // init to something reasonable
 
   if ( (timerNow - tempReadTimeout) > SAMPLE_INTERVAL_MS ) // update temp reading interval
   {
     // call sensors.requestTemperatures() to issue a global temperature request to all devices on the bus
     sensors.requestTemperatures(); // Send the command to get temperatures
     // Use the function ByIndex to get the temperature from the first sensor only.
-    //float tempC = sensors.getTempCByIndex(0);
-    float tempF = sensors.getTempFByIndex(0);
+    // tempC = sensors.getTempCByIndex(0);
+    tempF = sensors.getTempFByIndex(0); // update temp from sensor
         // Check if reading was successful
     if(tempF != DEVICE_DISCONNECTED_C) 
     {
@@ -176,6 +282,8 @@ void loop(void)
     }
     tempReadTimeout = timerNow;
   }
+
+  checkSetAlarm( tempF );
 
   // on human readable timescale average data and send to display and esp link
   if ( (timerNow - displayTimeout) > DISPLAY_UPDATE_INTERVAL_MS ) // update display interval
